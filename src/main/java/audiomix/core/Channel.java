@@ -32,7 +32,7 @@ public final class Channel {
     private volatile boolean muted;
     private volatile boolean solo;
     private volatile boolean sourceExhausted;
-    private boolean active;
+    private volatile boolean active;
 
     /**
      * Creates a new channel strip.
@@ -65,12 +65,16 @@ public final class Channel {
 
     /**
      * Replaces the audio source. Callable from any thread.
+     * Setting a non-null source marks the channel active immediately
+     * (before the next {@link #process()} call), so the mixer recognises
+     * it has work to do.
      *
      * @param s new source (may be null to clear)
      */
     public void setSource(Source s) {
         this.source = s;
         this.sourceExhausted = false;
+        this.active = s != null;
     }
 
     /** Returns the current source, or {@code null}. */
@@ -235,6 +239,8 @@ public final class Channel {
      * @return true if the channel contributes to the mix
      */
     public boolean isActive() { return active; }
+
+    void zeroStaging() { staging.clear(); }
 
     /**
      * True when every effect in the chain reports idle.
