@@ -36,7 +36,7 @@ mvn test
 ```java
 Mixer m = new Mixer(48000);
 Channel voc = m.addChannel("vocals");
-voc.setSource(new FileSource("vocals.wav"));
+voc.setSource(new FileSource(Path.of("vocals.wav"), 48000));  // auto-resampled if needed
 voc.addEffect(new ParametricEq(48000).band(EqType.PEAK, 1000, 3.0, 1.0f));
 voc.setGainDb(-3);
 voc.addSend(m.getAux("reverb"), 0.4);
