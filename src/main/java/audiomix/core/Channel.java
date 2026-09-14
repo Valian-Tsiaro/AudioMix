@@ -33,6 +33,7 @@ public final class Channel {
     private volatile boolean solo;
     private volatile boolean sourceExhausted;
     private volatile boolean active;
+    private long framesServed;
 
     /**
      * Creates a new channel strip.
@@ -163,12 +164,14 @@ public final class Channel {
         Source src = source;
         if (src != null) {
             // ponytail: direct read into staging; source fills all channels of
-            // whatever buffer it's given (Step 4 convention). Stereo→mono
-            // averaging deferred to Step 9 when sources expose getChannels().
+            // whatever buffer it's given. Stereo→mono averaging deferred
+            // (sources expose getChannels() but Channel is mono/stereo only).
             try {
                 int filled = src.read(staging);
                 if (filled == 0) {
                     sourceExhausted = true;
+                } else {
+                    framesServed += filled;
                 }
             } catch (Exception ex) {
                 staging.clear();
@@ -251,4 +254,13 @@ public final class Channel {
     public boolean isChainIdle() {
         return effects.isEmpty() || effects.stream().allMatch(Effect::isIdle);
     }
+
+    /**
+     * Total frames pulled from this channel's source so far.
+     * Monotonic; 0 before the first {@link #process()} with a live source.
+     *
+     * @return cumulative frames read (may exceed actual content length if
+     *         the source over-reads; for finite sources this is exact)
+     */
+    long framesServed() { return framesServed; }
 }

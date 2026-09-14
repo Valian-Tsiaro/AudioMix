@@ -1,5 +1,10 @@
 package audiomix.core;
 
+import audiomix.io.AudioIOException;
+import audiomix.io.WavFormat;
+import audiomix.io.WavWriter;
+
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -155,5 +160,94 @@ public final class Mixer {
      */
     public boolean allIdle() {
         return isExhausted() && master.isChainIdle();
+    }
+
+    /**
+     * Offline render to a stereo FLOAT32 WAV file.
+     *
+     * @param path output file path
+     * @throws AudioIOException on write error
+     */
+    public void renderToFile(String path) {
+        renderToFile(path, WavFormat.FLOAT32);
+    }
+
+    /**
+     * Offline render to a stereo WAV file in the given format.
+     * Termination is guaranteed by {@link #allIdle()} semantics — every
+     * channel's source must exhaust and every effect tail must decay.
+     * The output frame count is exact: trailing zero-padded blocks are
+     * discarded, and the final block is trimmed to the last frame that
+     * could contain content.
+     * <p>
+     * The caller retains ownership of all sources and effects; this
+     * method does not close them.
+     *
+     * @param path output file path
+     * @param fmt  sample format (PCM16, PCM24, or FLOAT32)
+     * @throws AudioIOException on write error
+     */
+    public void renderToFile(String path, WavFormat fmt) {
+        WavWriter writer = new WavWriter(Path.of(path), 2, sampleRate, fmt);
+        AudioBuffer buf = AudioBuffer.create(2, blockSize);
+        AudioBuffer pending = AudioBuffer.create(2, blockSize);
+        boolean pendingSet = false;
+        long written = 0;
+        try {
+            while (true) {
+                processBlock(buf);
+                if (pendingSet) {
+                    if (!allIdle()) {
+                        writer.write(pending);
+                        written += blockSize;
+                    } else {
+                        long served = 0;
+                        for (Channel ch : channels) {
+                            served = Math.max(served, ch.framesServed());
+                        }
+                        int lastNzP = lastNonzero(pending);
+                        int lastNzC = lastNonzero(buf);
+                        long total = Math.max(served, written + lastNzP + 1);
+                        if (lastNzC >= 0) {
+                            total = Math.max(total, written + blockSize + lastNzC + 1);
+                        }
+                        long takeP = Math.min(Math.max(total - written, 0), blockSize);
+                        if (takeP > 0) {
+                            AudioBuffer trim = AudioBuffer.create(2, (int) takeP);
+                            for (int ch = 0; ch < 2; ch++) {
+                                System.arraycopy(pending.data[ch], 0, trim.data[ch], 0, (int) takeP);
+                            }
+                            writer.write(trim);
+                        }
+                        long takeC = Math.min(Math.max(total - written - takeP, 0), blockSize);
+                        if (takeC > 0) {
+                            AudioBuffer trim = AudioBuffer.create(2, (int) takeC);
+                            for (int ch = 0; ch < 2; ch++) {
+                                System.arraycopy(buf.data[ch], 0, trim.data[ch], 0, (int) takeC);
+                            }
+                            writer.write(trim);
+                        }
+                        break;
+                    }
+                }
+                // swap pending/buf
+                AudioBuffer tmp = pending;
+                pending = buf;
+                buf = tmp;
+                pendingSet = true;
+            }
+        } finally {
+            writer.close();
+        }
+    }
+
+    /** Returns the index of the last frame containing a nonzero sample, or -1 if all zero. */
+    private static int lastNonzero(AudioBuffer b) {
+        for (int i = b.frames - 1; i >= 0; i--) {
+            for (int ch = 0; ch < b.channels(); ch++) {
+                if (b.data[ch][i] != 0.0f) return i;
+            }
+        }
+        return -1;
     }
 }
