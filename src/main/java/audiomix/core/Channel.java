@@ -24,8 +24,12 @@ public final class Channel {
     private final int channelCount;
     private final int blockSize;
     private final AudioBuffer staging;
-    private final ParamSmoother gainSmoother;
-    private final double[] gainPerSample;
+    private final ParamSmoother leftSmoother;
+    private final ParamSmoother rightSmoother;
+    private final double[] leftGainPerSample;
+    private final double[] rightGainPerSample;
+    private volatile double gainTarget = 1.0;
+    private volatile Double panPosition;
     private final CopyOnWriteArrayList<Effect> effects = new CopyOnWriteArrayList<>();
 
     private volatile Source source;
@@ -53,9 +57,12 @@ public final class Channel {
         this.channelCount = channels;
         this.blockSize = blockSize;
         this.staging = AudioBuffer.create(channels, blockSize);
-        this.gainSmoother = new ParamSmoother(sampleRate, GAIN_RAMP_MS);
-        this.gainSmoother.setValue(1.0);
-        this.gainPerSample = new double[blockSize];
+        this.leftSmoother = new ParamSmoother(sampleRate, GAIN_RAMP_MS);
+        this.leftSmoother.setValue(1.0);
+        this.rightSmoother = new ParamSmoother(sampleRate, GAIN_RAMP_MS);
+        this.rightSmoother.setValue(1.0);
+        this.leftGainPerSample = new double[blockSize];
+        this.rightGainPerSample = new double[blockSize];
     }
 
     /** Returns the strip name. */
@@ -89,7 +96,8 @@ public final class Channel {
      */
     public void setGain(double g) {
         if (g < 0) throw new IllegalArgumentException("gain=" + g);
-        gainSmoother.setTarget(g);
+        gainTarget = g;
+        retarget();
     }
 
     /**
@@ -99,6 +107,53 @@ public final class Channel {
      */
     public void setGainDb(double db) {
         setGain(GainMath.dbToLinear(db));
+    }
+
+    /**
+     * Sets the stereo pan position on a mono strip. Callable from any thread.
+     * The value is clamped to [-1, 1] and smoothed over ~10 ms.
+     *
+     * @param x pan in [-1, 1] (left to right)
+     * @throws IllegalStateException if this is a stereo strip
+     */
+    public void setPan(double x) {
+        if (channelCount != 1) throw new IllegalStateException("setPan on stereo strip");
+        panPosition = GainMath.clamp(x, -1.0, 1.0);
+        retarget();
+    }
+
+    /**
+     * Sets the L/R balance on a stereo strip. Callable from any thread.
+     * The value is clamped to [-1, 1] and smoothed over ~10 ms.
+     * Positive attenuates left; negative attenuates right.
+     *
+     * @param x balance in [-1, 1]
+     * @throws IllegalStateException if this is a mono strip
+     */
+    public void setBalance(double x) {
+        if (channelCount != 2) throw new IllegalStateException("setBalance on mono strip");
+        panPosition = GainMath.clamp(x, -1.0, 1.0);
+        retarget();
+    }
+
+    private void retarget() {
+        double g = gainTarget;
+        if (channelCount == 1) {
+            if (panPosition != null) {
+                double[] p = GainMath.equalPowerPan(panPosition);
+                leftSmoother.setTarget(p[0] * g);
+                rightSmoother.setTarget(p[1] * g);
+            } else {
+                leftSmoother.setTarget(g);
+                rightSmoother.setTarget(g);
+            }
+        } else {
+            double x = panPosition != null ? panPosition : 0.0;
+            double lg = x > 0 ? 1 - x : 1.0;
+            double rg = x < 0 ? 1 + x : 1.0;
+            leftSmoother.setTarget(lg * g);
+            rightSmoother.setTarget(rg * g);
+        }
     }
 
     /**
@@ -187,7 +242,8 @@ public final class Channel {
             }
         }
         for (int i = 0; i < blockSize; i++) {
-            gainPerSample[i] = gainSmoother.nextValue();
+            leftGainPerSample[i] = leftSmoother.nextValue();
+            rightGainPerSample[i] = rightSmoother.nextValue();
         }
         active = src != null && (!sourceExhausted || !isChainIdle());
         return active;
@@ -199,10 +255,10 @@ public final class Channel {
      * <pre>audible = isSolo() || (!anySoloActive &amp;&amp; !isMuted())</pre>
      * When not audible, contributes silence.
      * <p>
-     * Gain is ramped click-free over ~10 ms. Per-sample gain values
-     * are pre-computed during {@link #process()} and consumed here.
-     * Mono staging is added identically to both L and R; stereo
-     * staging is per channel.
+     * Per-sample left/right gains are pre-computed during {@link #process()}
+     * incorporating pan/balance and fader gain, ramped click-free over ~10 ms.
+     * Mono staging is split across L/R by the equal-power pan law;
+     * stereo staging uses the balance multiplier per channel.
      *
      * @param stereoDest     stereo destination buffer (2 channels, frames == blockSize)
      * @param anySoloActive  true if any channel in the mix is soloed
@@ -224,12 +280,12 @@ public final class Channel {
         }
 
         for (int i = 0; i < blockSize; i++) {
-            double g = gainPerSample[i];
-            for (int ch = 0; ch < channelCount; ch++) {
-                stereoDest.data[ch][i] += g * staging.data[ch][i];
-            }
-            if (channelCount == 1) {
-                stereoDest.data[1][i] += g * staging.data[0][i];
+            if (channelCount == 2) {
+                stereoDest.data[0][i] += leftGainPerSample[i] * staging.data[0][i];
+                stereoDest.data[1][i] += rightGainPerSample[i] * staging.data[1][i];
+            } else {
+                stereoDest.data[0][i] += leftGainPerSample[i] * staging.data[0][i];
+                stereoDest.data[1][i] += rightGainPerSample[i] * staging.data[0][i];
             }
         }
     }
