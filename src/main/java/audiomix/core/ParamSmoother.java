@@ -65,11 +65,15 @@ public final class ParamSmoother {
 
     /**
      * Advances the ramp by one sample and returns the new current value.
-     * Audio thread only.
+     * Without the monitor, a concurrent {@link #setTarget} could write a
+     * fresh target between the ramp increment and the overshoot check,
+     * causing a full-range snap in a single sample. Synchronized on the
+     * same monitor as {@link #setTarget} and {@link #setValue} to prevent
+     * this; no additional lock is introduced.
      *
      * @return current value after one sample of movement
      */
-    public double nextValue() {
+    public synchronized double nextValue() {
         if (remaining <= 0) return current;
         current += step;
         remaining--;
