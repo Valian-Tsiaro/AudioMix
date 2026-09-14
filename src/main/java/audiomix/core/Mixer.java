@@ -22,6 +22,7 @@ public final class Mixer {
     private final int sampleRate;
     private final int blockSize;
     private final CopyOnWriteArrayList<Channel> channels = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<AuxBus> auxBuses = new CopyOnWriteArrayList<>();
     private final MasterBus master;
 
     /**
@@ -92,6 +93,40 @@ public final class Mixer {
      */
     public List<Channel> getChannels() { return Collections.unmodifiableList(channels); }
 
+    /**
+     * Adds an auxiliary bus for FX routing.
+     *
+     * @param name bus name (non-null, non-blank)
+     * @return the new aux bus
+     * @throws IllegalArgumentException if name is null or blank
+     */
+    public AuxBus addAuxBus(String name) {
+        if (name == null || name.isBlank()) throw new IllegalArgumentException("name=" + name);
+        AuxBus aux = new AuxBus(name, sampleRate, blockSize);
+        auxBuses.add(aux);
+        return aux;
+    }
+
+    /**
+     * Returns the first aux bus with the given name, or {@code null}.
+     *
+     * @param name bus name
+     * @return matching aux bus, or null
+     */
+    public AuxBus getAux(String name) {
+        for (AuxBus aux : auxBuses) {
+            if (aux.getName().equals(name)) return aux;
+        }
+        return null;
+    }
+
+    /**
+     * Unmodifiable live view of the aux bus list.
+     *
+     * @return current aux buses
+     */
+    public List<AuxBus> getAuxBuses() { return Collections.unmodifiableList(auxBuses); }
+
     public MasterBus getMaster() { return master; }
 
     public int getSampleRate() { return sampleRate; }
@@ -109,8 +144,9 @@ public final class Mixer {
 
     /**
      * Pull one block from all channels into {@code stereoDest},
-     * then run the master bus. Per-channel or per-effect failures
-     * degrade to silence for that contribution; exceptions never escape.
+     * process aux bus sends and chains, then run the master bus.
+     * Per-channel or per-effect failures degrade to silence for that
+     * contribution; exceptions never escape.
      *
      * @param stereoDest stereo destination (2 channels × blockSize frames)
      * @throws IllegalArgumentException if dimensions are wrong
@@ -124,14 +160,33 @@ public final class Mixer {
         }
 
         stereoDest.clear();
+        for (AuxBus aux : auxBuses) {
+            aux.clearSum();
+        }
         boolean solo = anySolo();
 
         for (Channel ch : channels) {
             try {
-                if (ch.process()) ch.mixInto(stereoDest, solo);
+                if (ch.process()) {
+                    ch.mixInto(stereoDest, solo);
+                    ch.sendInto(solo);
+                }
             } catch (Throwable t) {
                 ch.zeroStaging();
                 LOG.warning("channel failed: " + t.getMessage());
+            }
+        }
+
+        for (AuxBus aux : auxBuses) {
+            try {
+                aux.applyChainAndGain(aux.sum());
+                for (int i = 0; i < blockSize; i++) {
+                    stereoDest.data[0][i] += aux.sum().data[0][i];
+                    stereoDest.data[1][i] += aux.sum().data[1][i];
+                }
+            } catch (Throwable t) {
+                aux.clearSum();
+                LOG.warning("aux bus failed: " + t.getMessage());
             }
         }
 
@@ -159,7 +214,8 @@ public final class Mixer {
      * @return true if the entire mixer is silent
      */
     public boolean allIdle() {
-        return isExhausted() && master.isChainIdle();
+        return isExhausted() && master.isChainIdle()
+                && auxBuses.stream().allMatch(Bus::isChainIdle);
     }
 
     /**

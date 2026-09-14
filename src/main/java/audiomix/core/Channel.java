@@ -22,6 +22,7 @@ public final class Channel {
 
     private final String name;
     private final int channelCount;
+    private final int sampleRate;
     private final int blockSize;
     private final AudioBuffer staging;
     private final ParamSmoother leftSmoother;
@@ -31,6 +32,7 @@ public final class Channel {
     private volatile double gainTarget = 1.0;
     private volatile Double panPosition;
     private final CopyOnWriteArrayList<Effect> effects = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<Send> sends = new CopyOnWriteArrayList<>();
 
     private volatile Source source;
     private volatile boolean muted;
@@ -55,6 +57,7 @@ public final class Channel {
         if (blockSize <= 0) throw new IllegalArgumentException("blockSize=" + blockSize);
         this.name = name;
         this.channelCount = channels;
+        this.sampleRate = sampleRate;
         this.blockSize = blockSize;
         this.staging = AudioBuffer.create(channels, blockSize);
         this.leftSmoother = new ParamSmoother(sampleRate, GAIN_RAMP_MS);
@@ -203,6 +206,78 @@ public final class Channel {
     public List<Effect> getEffects() { return Collections.unmodifiableList(effects); }
 
     /**
+     * Adds a send to the given aux bus. Post-fader by default.
+     * Callable from any thread. If a send to this bus already exists,
+     * its level is snapped (no ramp) to the new value.
+     *
+     * @param bus   aux bus (non-null)
+     * @param level send level ≥ 0 (linear)
+     * @throws IllegalArgumentException if bus is null, level &lt; 0,
+     *         or bus block size does not match this channel's block size
+     */
+    public void addSend(AuxBus bus, double level) {
+        if (bus == null) throw new IllegalArgumentException("bus is null");
+        if (level < 0) throw new IllegalArgumentException("level=" + level);
+        if (bus.blockSize != blockSize) {
+            throw new IllegalArgumentException(
+                    "blockSize mismatch: channel=" + blockSize + " bus=" + bus.blockSize);
+        }
+        for (Send s : sends) {
+            if (s.bus == bus) {
+                s.level.setValue(level);
+                return;
+            }
+        }
+        sends.add(new Send(bus, sampleRate, level));
+    }
+
+    /**
+     * Sets the send level to the given bus. Callable from any thread.
+     *
+     * @param bus   aux bus
+     * @param level new send level ≥ 0 (linear), smoothed over ~10 ms
+     * @throws IllegalArgumentException if no send to this bus exists or level &lt; 0
+     */
+    public void setSendLevel(AuxBus bus, double level) {
+        if (level < 0) throw new IllegalArgumentException("level=" + level);
+        for (Send s : sends) {
+            if (s.bus == bus) {
+                s.level.setTarget(level);
+                return;
+            }
+        }
+        throw new IllegalArgumentException("no send to " + bus.getName());
+    }
+
+    /**
+     * Sets whether a send taps pre-fader. Callable from any thread.
+     * Pre-fader bypasses fader and pan; mute still kills the send.
+     *
+     * @param bus  aux bus
+     * @param pre  true for pre-fader
+     * @throws IllegalArgumentException if no send to this bus exists
+     */
+    public void setSendPreFader(AuxBus bus, boolean pre) {
+        for (Send s : sends) {
+            if (s.bus == bus) {
+                s.preFader = pre;
+                return;
+            }
+        }
+        throw new IllegalArgumentException("no send to " + bus.getName());
+    }
+
+    /**
+     * Removes the send to the given aux bus. Callable from any thread.
+     * No-op if no send to this bus exists.
+     *
+     * @param bus aux bus
+     */
+    public void removeSend(AuxBus bus) {
+        sends.removeIf(s -> s.bus == bus);
+    }
+
+    /**
      * Process one block: clear staging, pull source into staging,
      * run the insert chain over staging. Returns whether the channel
      * is still active (source not exhausted or chain not idle).
@@ -299,6 +374,35 @@ public final class Channel {
      */
     public boolean isActive() { return active; }
 
+    /**
+     * Add this channel's send contributions into the aux sum buffers.
+     * Post-fader sends tap the same gain-applied staging that mixInto used;
+     * pre-fader sends tap raw staging (post-insert-chain), bypassing fader/pan.
+     * Mute/solo gating is the same as mixInto.
+     */
+    void sendInto(boolean anySoloActive) {
+        boolean audible = solo || (!anySoloActive && !muted);
+        if (!audible) return;
+        for (Send send : sends) {
+            AudioBuffer sum = send.bus.sum();
+            for (int i = 0; i < blockSize; i++) {
+                double lv = send.level.nextValue();
+                if (send.preFader) {
+                    sum.data[0][i] += (float) (lv * staging.data[0][i]);
+                    sum.data[1][i] += (float) (lv * staging.data[channelCount == 2 ? 1 : 0][i]);
+                } else {
+                    if (channelCount == 2) {
+                        sum.data[0][i] += (float) (lv * leftGainPerSample[i] * staging.data[0][i]);
+                        sum.data[1][i] += (float) (lv * rightGainPerSample[i] * staging.data[1][i]);
+                    } else {
+                        sum.data[0][i] += (float) (lv * leftGainPerSample[i] * staging.data[0][i]);
+                        sum.data[1][i] += (float) (lv * rightGainPerSample[i] * staging.data[0][i]);
+                    }
+                }
+            }
+        }
+    }
+
     void zeroStaging() { staging.clear(); }
 
     /**
@@ -310,7 +414,7 @@ public final class Channel {
     public boolean isChainIdle() {
         return effects.isEmpty() || effects.stream().allMatch(Effect::isIdle);
     }
-
+    
     /**
      * Total frames pulled from this channel's source so far.
      * Monotonic; 0 before the first {@link #process()} with a live source.
