@@ -2,16 +2,17 @@ package audiomix.io;
 
 import audiomix.core.AudioBuffer;
 import java.io.*;
+import java.math.BigInteger;
 import java.nio.file.Path;
 
 /**
- * Streaming WAV reader. Parses standard little-endian RIFF/WAVE files.
- * Unknown chunks are skipped; compressed or extended-format files
- * are rejected with {@link AudioIOException}.
+ * Streaming AIFF reader. Parses standard FORM/AIFF files with
+ * uncompressed PCM16 or PCM24 data. AIFC files are
+ * rejected. Unknown chunks are skipped.
  *
  * <p>Not thread-safe; call {@link #read} from a single thread only.</p>
  */
-public final class WavReader implements AudioFileReader {
+public final class AiffReader implements AudioFileReader {
     private int channels;
     private int sampleRate;
     private WavFormat format;
@@ -22,12 +23,12 @@ public final class WavReader implements AudioFileReader {
     private long framesRead;
 
     /**
-     * Opens a WAV file for reading.
+     * Opens an AIFF file for reading.
      *
      * @param path input file path
      * @throws AudioIOException if the file is malformed, truncated, or uses an unsupported format
      */
-    public WavReader(Path path) {
+    public AiffReader(Path path) {
         try {
             in = new BufferedInputStream(new FileInputStream(path.toFile()));
         } catch (FileNotFoundException e) {
@@ -48,28 +49,34 @@ public final class WavReader implements AudioFileReader {
     }
 
     private void parseHeader() throws IOException {
-        byte[] riff = readFully(12);
-        if (!matches(riff, 0, "RIFF") || !matches(riff, 8, "WAVE")) {
-            throw new AudioIOException("not a RIFF/WAVE file");
+        byte[] hdr = readFully(12);
+        if (!matches(hdr, 0, "FORM") || !matches(hdr, 8, "AIFF")) {
+            throw new AudioIOException("not an AIFF file");
         }
-        int channels = 0, sampleRate = 0, tag = 0, bits = 0;
-        long dataSize = -1;
-        boolean foundFmt = false;
+        int channels = 0, sampleRate = 0, sampleSize = 0;
+        long frameCount = -1;
+        boolean foundComm = false;
         while (true) {
             byte[] chunkHdr = readFully(8);
-            int size = le32(chunkHdr, 4);
-            if (matches(chunkHdr, 0, "fmt ")) {
-                if (size < 16) throw new AudioIOException("fmt chunk too small");
-                byte[] fmt = readFully(size);
-                tag = le16(fmt, 0);
-                channels = le16(fmt, 2);
-                sampleRate = le32(fmt, 4);
-                bits = le16(fmt, 14);
+            int size = be32(chunkHdr, 4);
+            if (matches(chunkHdr, 0, "COMM")) {
+                if (size < 18) throw new AudioIOException("COMM chunk too small");
+                byte[] comm = readFully(18);
+                channels = be16(comm, 0);
+                frameCount = be32(comm, 2) & 0xFFFFFFFFL;
+                sampleSize = be16(comm, 6);
+                sampleRate = decodeExtended(comm, 8);
                 if (channels < 1 || channels > 8) throw new AudioIOException("unsupported channels: " + channels);
-                foundFmt = true;
-            } else if (matches(chunkHdr, 0, "data")) {
-                if (!foundFmt) throw new AudioIOException("data before fmt");
-                dataSize = size & 0xFFFFFFFFL;
+                if (sampleRate <= 0) throw new AudioIOException("unsupported sample rate: " + sampleRate);
+                foundComm = true;
+            } else if (matches(chunkHdr, 0, "SSND")) {
+                if (!foundComm) throw new AudioIOException("SSND before COMM");
+                if (size < 8) throw new AudioIOException("SSND chunk too small");
+                byte[] ssndHdr = readFully(8);
+                long offset = be32(ssndHdr, 0) & 0xFFFFFFFFL;
+                long blockSize = be32(ssndHdr, 4) & 0xFFFFFFFFL;
+                if (offset != 0 || blockSize != 0)
+                    throw new AudioIOException("non-standard SSND offset/blockSize");
                 break;
             } else {
                 long toSkip = size;
@@ -81,14 +88,16 @@ public final class WavReader implements AudioFileReader {
                 if ((size & 1) == 1) in.read();
             }
         }
-        if (!foundFmt) throw new AudioIOException("no fmt chunk");
-        if (tag == 0xFFFE) throw new AudioIOException("unsupported format tag: " + tag);
-        WavFormat fmt = WavFormat.fromTag(tag, bits);
+        if (!foundComm) throw new AudioIOException("no COMM chunk");
+        WavFormat fmt;
+        if (sampleSize == 16) fmt = WavFormat.PCM16;
+        else if (sampleSize == 24) fmt = WavFormat.PCM24;
+        else throw new AudioIOException("unsupported sample size: " + sampleSize);
         int blockAlign = channels * fmt.bytesPerSample();
         this.channels = channels;
         this.sampleRate = sampleRate;
         this.format = fmt;
-        this.frameCount = blockAlign > 0 ? dataSize / blockAlign : 0;
+        this.frameCount = frameCount;
     }
 
     private byte[] readFully(int len) throws IOException {
@@ -113,13 +122,27 @@ public final class WavReader implements AudioFileReader {
         return true;
     }
 
-    private static int le16(byte[] b, int off) {
-        return (b[off] & 0xFF) | ((b[off + 1] & 0xFF) << 8);
+    private static int be16(byte[] b, int off) {
+        return ((b[off] & 0xFF) << 8) | (b[off + 1] & 0xFF);
     }
 
-    private static int le32(byte[] b, int off) {
-        return (b[off] & 0xFF) | ((b[off + 1] & 0xFF) << 8) |
-                ((b[off + 2] & 0xFF) << 16) | ((b[off + 3] & 0xFF) << 24);
+    private static int be32(byte[] b, int off) {
+        return ((b[off] & 0xFF) << 24) | ((b[off + 1] & 0xFF) << 16) |
+                ((b[off + 2] & 0xFF) << 8) | (b[off + 3] & 0xFF);
+    }
+
+    private static int decodeExtended(byte[] b, int off) {
+        long sign = ((b[off] & 0x80) != 0) ? -1L : 1L;
+        int exponent = ((b[off] & 0x7F) << 8) | (b[off + 1] & 0xFF);
+        BigInteger mantissa = BigInteger.ZERO;
+        for (int i = 0; i < 8; i++) {
+            mantissa = mantissa.shiftLeft(8).or(BigInteger.valueOf(b[off + 2 + i] & 0xFF));
+        }
+        mantissa = mantissa.or(BigInteger.ONE.shiftLeft(63));
+        if (exponent == 0) return 0;
+        int shift = 63 - (exponent - 16383);
+        if (shift < 0) throw new AudioIOException("unsupported sample rate");
+        return (int) (sign * mantissa.shiftRight(shift).longValue());
     }
 
     /** Returns the number of channels in the file (1–8). */
@@ -128,20 +151,20 @@ public final class WavReader implements AudioFileReader {
     /** Returns the sample rate in Hz. */
     public int getSampleRate() { return sampleRate; }
 
-    /** Returns the total number of audio frames in the data chunk. */
+    /** Returns the total number of audio frames. */
     public long getFrameCount() { return frameCount; }
 
     /** Returns the sample format of this file. */
     public WavFormat getFormat() { return format; }
 
     /**
-     * Reads audio frames into the buffer. Returns frames filled; 0 if at
-     * EOF (stays 0 forever). Partial fills are returned near EOF.
+     * Reads audio frames into the buffer. Returns frames filled; 0 at
+     * EOF (stays 0 forever). Partial fills near EOF.
      *
      * @param b destination buffer; channel count must match the file
-     * @return number of frames actually read (0 at EOF)
+     * @return frames actually read (0 at EOF)
      * @throws IllegalArgumentException if buffer channel count differs
-     * @throws AudioIOException         if the data chunk is shorter than its header claims
+     * @throws AudioIOException         if the data chunk is shorter than claimed
      */
     public int read(AudioBuffer b) {
         if (b.channels() != channels) throw new IllegalArgumentException("channel mismatch");
@@ -158,22 +181,20 @@ public final class WavReader implements AudioFileReader {
             for (int ch = 0; ch < channels; ch++) {
                 switch (format) {
                     case PCM16 -> {
-                        int s = le16(block, idx);
+                        int s = be16(block, idx);
                         if (s > 32767) s -= 65536;
                         b.set(ch, i, s / 32767f);
                         idx += 2;
                     }
                     case PCM24 -> {
-                        int s = (block[idx] & 0xFF) | ((block[idx + 1] & 0xFF) << 8) | ((block[idx + 2] & 0xFF) << 16);
+                        int s = ((block[idx] & 0xFF) << 16) |
+                                ((block[idx + 1] & 0xFF) << 8) |
+                                (block[idx + 2] & 0xFF);
                         if ((s & 0x800000) != 0) s |= 0xFF000000;
                         b.set(ch, i, s / 8388607f);
                         idx += 3;
                     }
-                    case FLOAT32 -> {
-                        int bits = le32(block, idx);
-                        b.set(ch, i, Float.intBitsToFloat(bits));
-                        idx += 4;
-                    }
+                    default -> throw new AudioIOException("unsupported format: " + format);
                 }
             }
         }

@@ -3,15 +3,20 @@ package audiomix.source;
 import audiomix.core.AudioBuffer;
 import audiomix.core.Source;
 import audiomix.dsp.Resampler;
+import audiomix.io.AudioFileReader;
 import audiomix.io.AudioIOException;
+import audiomix.io.AiffReader;
 import audiomix.io.WavReader;
 
+import java.io.FileInputStream;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.logging.Logger;
 
 /**
- * File-backed {@link Source} that reads a WAV and resamples to the
- * project sample rate on the fly. At EOF the source returns 0 forever.
+ * File-backed {@link Source} that reads a WAV or AIFF file and resamples
+ * to the project sample rate on the fly. Format is auto-detected from
+ * the file header. At EOF the source returns 0 forever.
  *
  * <p>Channel mapping: a mono file is duplicated to every channel of the
  * destination buffer. A multi-channel file is mapped index-by-index;
@@ -23,7 +28,7 @@ public final class FileSource implements Source, AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(FileSource.class.getName());
 
-    private final WavReader reader;
+    private final AudioFileReader reader;
     private final Resampler resampler;
     private final int fileChannels;
 
@@ -34,7 +39,8 @@ public final class FileSource implements Source, AutoCloseable {
     private boolean closed;
 
     /**
-     * Opens a WAV file for playback through the mixer.
+     * Opens a WAV or AIFF file for playback through the mixer.
+     * Format is auto-detected from the file header.
      *
      * @param path              input file path
      * @param projectSampleRate project sample rate in Hz (&gt; 0)
@@ -43,21 +49,37 @@ public final class FileSource implements Source, AutoCloseable {
      */
     public FileSource(Path path, int projectSampleRate) {
         if (projectSampleRate <= 0) throw new IllegalArgumentException("projectSampleRate=" + projectSampleRate);
-        this.reader = new WavReader(path);
+        this.reader = openFile(path);
         this.fileChannels = reader.getChannels();
         int nativeRate = reader.getSampleRate();
         this.resampler = (nativeRate == projectSampleRate) ? null : new Resampler(nativeRate, projectSampleRate, fileChannels);
     }
 
+    private static AudioFileReader openFile(Path path) {
+        byte[] magic = new byte[12];
+        try (var fis = new FileInputStream(path.toFile())) {
+            if (fis.read(magic) < 12) throw new AudioIOException("file too short");
+        } catch (IOException e) {
+            throw new AudioIOException("cannot read: " + path, e);
+        }
+        if (magic[0] == 'R' && magic[1] == 'I' && magic[2] == 'F' && magic[3] == 'F') {
+            return new WavReader(path);
+        }
+        if (magic[0] == 'F' && magic[1] == 'O' && magic[2] == 'R' && magic[3] == 'M') {
+            return new AiffReader(path);
+        }
+        throw new AudioIOException("unsupported audio format");
+    }
+
     /**
-     * Returns the channel count of the underlying WAV file.
+     * Returns the channel count of the underlying audio file.
      *
      * @return file channel count (1–8)
      */
     public int getChannels() { return fileChannels; }
 
     /**
-     * Returns the native sample rate of the WAV file.
+     * Returns the native sample rate of the audio file.
      *
      * @return sample rate in Hz
      */
