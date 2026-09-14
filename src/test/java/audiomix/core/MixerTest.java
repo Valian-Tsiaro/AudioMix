@@ -1,5 +1,6 @@
 package audiomix.core;
 
+import audiomix.dsp.effects.Meter;
 import audiomix.source.SineSource;
 import org.junit.jupiter.api.Test;
 
@@ -299,5 +300,37 @@ class MixerTest {
     void getChannelReturnsNullForUnknownName() {
         Mixer m = new Mixer(SR, BS);
         assertNull(m.getChannel("nope"));
+    }
+
+    // ── meter transparency ──────────────────────────────────────────
+
+    @Test
+    void meterIsTransparent() {
+        Mixer m = new Mixer(SR, BS);
+        m.addChannel("A").setSource(sine(440, 0.25, -1));
+        m.addChannel("B").setSource(sine(880, 0.25, -1));
+
+        Meter meter = new Meter(1);
+        m.getChannel("A").addEffect(meter);
+
+        AudioBuffer dest = AudioBuffer.create(2, BS);
+        int blocks = 0;
+        for (int i = 0; i < 4; i++) {
+            m.processBlock(dest);
+            blocks++;
+        }
+
+        long n0 = (long) (blocks - 1) * BS;
+        for (int ch = 0; ch < 2; ch++) {
+            for (int i = 0; i < BS; i++) {
+                double t = (n0 + i) / (double) SR;
+                float expected = (float) analyticSum(t, 440, 880, 0.25);
+                assertEquals(expected, dest.data[ch][i], 1e-5,
+                        "ch=" + ch + " frame=" + i);
+            }
+        }
+
+        // meter was actually in the path
+        assertTrue(meter.getPeakDbfs(0) > Double.NEGATIVE_INFINITY);
     }
 }
