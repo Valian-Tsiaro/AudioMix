@@ -26,7 +26,7 @@ public final class Compressor implements Effect {
      * Creates a compressor at the given sample rate.
      *
      * @param sampleRate project sample rate in Hz, must be positive
-     * @throws IllegalArgumentException if sampleRate <= 0
+     * @throws IllegalArgumentException if sampleRate &le; 0
      */
     public Compressor(int sampleRate) {
         if (sampleRate <= 0) {

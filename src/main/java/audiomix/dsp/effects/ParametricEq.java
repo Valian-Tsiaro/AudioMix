@@ -23,7 +23,7 @@ public final class ParametricEq implements Effect {
      * Creates an EQ at the given project sample rate.
      *
      * @param sampleRate project sample rate in Hz, must be positive
-     * @throws IllegalArgumentException if sampleRate <= 0
+     * @throws IllegalArgumentException if sampleRate &le; 0
      */
     public ParametricEq(int sampleRate) {
         if (sampleRate <= 0) {
@@ -170,7 +170,7 @@ public final class ParametricEq implements Effect {
         /**
          * Sets quality factor, must be positive.
          *
-         * @throws IllegalArgumentException if q <= 0
+         * @throws IllegalArgumentException if q &le; 0
          */
         public void setQ(double q) {
             validateQ(q);
