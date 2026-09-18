@@ -1,6 +1,7 @@
 package audiomix.core;
 
 import audiomix.io.DeviceInfo;
+import audiomix.io.DeviceManager;
 
 import java.util.Collections;
 import java.util.List;
@@ -22,7 +23,7 @@ public class Bus {
     private final ParamSmoother gainSmoother;
     private final CopyOnWriteArrayList<Effect> effects = new CopyOnWriteArrayList<>();
     Mixer owner; // ponytail: set by Mixer; inert until Step 26
-    private static final audiomix.io.DeviceManager DEVICES = new audiomix.io.DeviceManager();
+    private static final DeviceManager DEVICES = new DeviceManager();
 
     /**
      * @param sampleRate project sample rate in Hz (&gt; 0)
