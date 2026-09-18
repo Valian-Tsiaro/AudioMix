@@ -199,6 +199,23 @@ public final class Mixer {
     }
 
     /**
+     * Render one block from the given bus into {@code dest}.
+     * Currently only the master bus is supported; any other bus
+     * throws {@link IllegalStateException}.
+     *
+     * @param bus  the bus to render (must be the master bus)
+     * @param dest stereo destination ({@code 2} channels × {@code blockSize} frames)
+     * @throws IllegalStateException    if {@code bus} is not the master bus
+     * @throws IllegalArgumentException if dest dimensions are wrong
+     */
+    public void renderBusBlock(Bus bus, AudioBuffer dest) {
+        if (bus != master) {
+            throw new IllegalStateException("only the master bus is renderable for now");
+        }
+        processBlock(dest);
+    }
+
+    /**
      * True when every channel has finished (source exhausted and
      * chain idle).
      *
