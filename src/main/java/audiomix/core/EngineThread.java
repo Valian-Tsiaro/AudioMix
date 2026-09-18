@@ -103,11 +103,6 @@ public final class EngineThread {
         long consecutive = 0;
         try {
             sink.open(STEREO, mixer.getSampleRate(), blockSize);
-        } catch (Throwable t) {
-            LOG.warning("engine sink open failed: " + t.getMessage());
-            return;
-        }
-        try {
             while (running.get()) {
                 boolean ok = true;
                 try {
@@ -128,6 +123,9 @@ public final class EngineThread {
                 if (ok) consecutive = 0;
                 framesWritten.addAndGet(blockSize);
             }
+        } catch (Throwable t) {
+            errorsLogged.incrementAndGet();
+            LOG.warning("engine sink open failed: " + t.getMessage());
         } finally {
             running.set(false);
             try { sink.close(); } catch (Throwable t) {

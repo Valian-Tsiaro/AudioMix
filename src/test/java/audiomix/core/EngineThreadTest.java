@@ -57,7 +57,6 @@ class EngineThreadTest {
         int channels;
         int sampleRate;
         int blockSize;
-        long writtenFrames;
         int writes;
         volatile boolean closed;
         final boolean record;
@@ -85,7 +84,6 @@ class EngineThreadTest {
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
             }
             int n = ++writes;
-            writtenFrames += frames;
             if (failAfterWrite >= 0 && n > failAfterWrite) throw new RuntimeException("sink boom");
             if (record) {
                 float[][] copy = new float[data.length][];
@@ -257,6 +255,36 @@ class EngineThreadTest {
         assertFalse(engine.isRunning());
         assertEquals(0, engine.errorsLogged());
         assertTrue(engine.framesWritten() > 0);
+    }
+
+    // ── open failure ────────────────────────────────────────────────
+
+    static final class FailingOpenSink implements AudioSink {
+        volatile boolean closed;
+
+        @Override
+        public void open(int channels, int sampleRate, int blockSize) {
+            throw new RuntimeException("device open failed");
+        }
+
+        @Override
+        public void write(float[][] data, int frames) { }
+
+        @Override
+        public void close() { closed = true; }
+    }
+
+    @Test
+    void openFailureStopsCleanly() {
+        Mixer m = new Mixer(SR, BS);
+        m.addChannel("x").setSource(new SineSource(SR, 440, 0.25, 1, -1));
+        FailingOpenSink sink = new FailingOpenSink();
+        EngineThread engine = new EngineThread(m, m.getMaster(), sink);
+        engine.start();
+        assertTrue(awaitStopped(engine, 5000), "engine stops on open failure");
+        assertFalse(engine.isRunning());
+        assertTrue(sink.closed, "sink closed even on open failure");
+        assertTrue(engine.errorsLogged() > 0, "open failure counted");
     }
 
     // ── interrupt unblocks a stuck sink ─────────────────────────────
