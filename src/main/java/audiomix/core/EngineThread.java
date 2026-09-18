@@ -91,7 +91,7 @@ public final class EngineThread {
     /** True while the engine thread is rendering. */
     public boolean isRunning() { return running.get(); }
 
-    /** Total frames pushed to the sink (full blocks). Monotonic. Counts silence blocks written during error containment even if the sink also rejects the retry. */
+    /** Total frames pushed to the sink (full blocks). Monotonic. Counts silence blocks written during error containment even if the sink also rejects the retry. Also counts blocks whose write was skipped by an interrupt. */
     public long framesWritten() { return framesWritten.get(); }
 
     /** Number of per-block failures contained by the engine. Monotonic. Counts each failed render or primary write; retry-failure is not double-counted. */
@@ -103,6 +103,11 @@ public final class EngineThread {
         long consecutive = 0;
         try {
             sink.open(STEREO, mixer.getSampleRate(), blockSize);
+        } catch (Throwable t) {
+            LOG.warning("engine sink open failed: " + t.getMessage());
+            return;
+        }
+        try {
             while (running.get()) {
                 boolean ok = true;
                 try {

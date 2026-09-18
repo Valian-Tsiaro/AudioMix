@@ -59,7 +59,7 @@ class EngineThreadTest {
         int blockSize;
         long writtenFrames;
         int writes;
-        boolean closed;
+        volatile boolean closed;
         final boolean record;
         final List<float[][]> blocks;
         final long sleepMs;
