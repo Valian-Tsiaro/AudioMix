@@ -2,242 +2,302 @@ package audiomix.core;
 
 import audiomix.dsp.effects.Delay;
 import audiomix.io.AudioSink;
+import audiomix.io.WavReader;
 import audiomix.source.SineSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-@Timeout(60)
+@Timeout(30)
 class EngineThreadTest {
 
     private static final int SR = 48000;
     private static final int BS = 512;
-    private static final int FINITE_FRAMES = (int) (SR * 0.3); // 14400
 
-    // ── TestSink ─────────────────────────────────────────────────────
+    // ── helpers ──────────────────────────────────────────────────────
 
-    static class TestSink implements AudioSink {
-        volatile boolean opened;
-        volatile boolean closed;
-        volatile int openedChannels;
-        volatile int openedSampleRate;
-        volatile int openedBlockSize;
-        volatile long totalFrames;
+    private static Mixer twoSines() {
+        Mixer m = new Mixer(SR, BS);
+        m.addChannel("a").setSource(new SineSource(SR, 440, 0.25, 1, (long) (SR * 0.3)));
+        m.addChannel("b").setSource(new SineSource(SR, 660, 0.25, 1, (long) (SR * 0.3)));
+        return m;
+    }
 
-        final List<float[][]> recorded = new ArrayList<>();
-        final CopyOnWriteArrayList<Throwable> sinkErrors = new CopyOnWriteArrayList<>();
+    private static boolean awaitStopped(EngineThread engine, long timeoutMs) {
+        long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (engine.isRunning()) {
+            if (System.nanoTime() >= end) return false;
+            try { Thread.sleep(1); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); return false; }
+        }
+        return true;
+    }
 
-        volatile long sleepMsPerWrite;
-        volatile int throwOnFirstN;        // first N writes throw RuntimeException
-        private int writeCount;
+    private static boolean awaitRunning(EngineThread engine, long timeoutMs) {
+        long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (!engine.isRunning()) {
+            if (System.nanoTime() >= end) return false;
+            try { Thread.sleep(1); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); return false; }
+        }
+        return true;
+    }
 
-        @Override
-        public void open(int channels, int sampleRate, int blockSize) {
-            openedChannels = channels;
-            openedSampleRate = sampleRate;
-            openedBlockSize = blockSize;
-            opened = true;
+    /** Non-blocking sink; counts and optionally records blocks, optionally sleeps, optionally fails. */
+    static final class TestSink implements AudioSink {
+        int channels;
+        int sampleRate;
+        int blockSize;
+        long writtenFrames;
+        int writes;
+        boolean closed;
+        final boolean record;
+        final List<float[][]> blocks;
+        final long sleepMs;
+        volatile int failAfterWrite = -1;
+
+        TestSink(long sleepMs, boolean record) {
+            this.sleepMs = sleepMs;
+            this.record = record;
+            this.blocks = record ? new ArrayList<>() : null;
         }
 
         @Override
-        public void write(float[][] data, int frames) throws InterruptedException {
-            if (sleepMsPerWrite > 0) {
-                TimeUnit.MILLISECONDS.sleep(sleepMsPerWrite);
+        public void open(int channels, int sampleRate, int blockSize) {
+            this.channels = channels;
+            this.sampleRate = sampleRate;
+            this.blockSize = blockSize;
+        }
+
+        @Override
+        public void write(float[][] data, int frames) {
+            if (sleepMs > 0) {
+                try { Thread.sleep(sleepMs); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
             }
-            if (writeCount < throwOnFirstN) {
-                writeCount++;
-                throw new RuntimeException("test sink write failure #" + writeCount);
+            int n = ++writes;
+            writtenFrames += frames;
+            if (failAfterWrite >= 0 && n > failAfterWrite) throw new RuntimeException("sink boom");
+            if (record) {
+                float[][] copy = new float[data.length][];
+                for (int c = 0; c < data.length; c++) copy[c] = data[c].clone();
+                blocks.add(copy);
             }
-            totalFrames += frames;
-            // copy block (engine reuses buffer)
-            float[][] copy = new float[data.length][];
-            for (int ch = 0; ch < data.length; ch++) {
-                copy[ch] = new float[frames];
-                System.arraycopy(data[ch], 0, copy[ch], 0, frames);
-            }
-            recorded.add(copy);
         }
 
         @Override
         public void close() { closed = true; }
+    }
 
-        void resetWriteCount() { writeCount = 0; }
+    /** Reads whole blocks of a constant, throws once on the Nth read, then exhausts. */
+    static final class ThrowingSource implements Source {
+        private final int throwOnRead;
+        private final float fill;
+        private int reads;
+        private boolean thrown;
 
-        float peak() {
-            float peak = 0;
-            for (float[][] block : recorded) {
-                for (float[] ch : block) {
-                    for (float s : ch) peak = Math.max(peak, Math.abs(s));
-                }
+        ThrowingSource(int throwOnRead, float fill) {
+            this.throwOnRead = throwOnRead;
+            this.fill = fill;
+        }
+
+        @Override
+        public int read(AudioBuffer b) {
+            if (thrown) return 0;
+            reads++;
+            if (reads == throwOnRead) {
+                thrown = true;
+                throw new RuntimeException("source boom");
             }
-            return peak;
+            for (float[] ch : b.data) Arrays.fill(ch, fill);
+            return b.frames;
+        }
+
+        @Override
+        public void close() { }
+    }
+
+    // ── realtime vs offline ──────────────────────────────────────────
+
+    @Test
+    void realtimeMatchesOfflineFrameCount(@TempDir Path tmp) {
+        Path out = tmp.resolve("offline.wav");
+        twoSines().renderToFile(out.toString());
+        long offline;
+        try (var r = new WavReader(out)) {
+            offline = r.getFrameCount();
+        }
+
+        Mixer m = twoSines();
+        TestSink sink = new TestSink(0, false);
+        EngineThread engine = new EngineThread(m, m.getMaster(), sink);
+        engine.start();
+        assertTrue(awaitStopped(engine, 10_000), "engine auto-stops on allIdle");
+        assertFalse(engine.isRunning());
+        long diff = Math.abs(engine.framesWritten() - offline);
+        assertTrue(diff <= BS, "engine frames vs offline render: diff=" + diff + " expected ≤ " + BS);
+        assertEquals(0, engine.errorsLogged());
+        assertEquals(2, sink.channels);
+        assertTrue(sink.closed, "sink closed on auto-stop");
+    }
+
+    // ── containment: throwing source ─────────────────────────────────
+
+    @Test
+    void throwingSourceSurvivesAndAutoStops() {
+        Mixer m = new Mixer(SR, BS);
+        m.addChannel("bad").setSource(new ThrowingSource(4, 0.125f));
+        m.addChannel("good").setSource(new SineSource(SR, 440, 0.25, 1, (long) (SR * 0.3)));
+        TestSink sink = new TestSink(0, true);
+        EngineThread engine = new EngineThread(m, m.getMaster(), sink);
+        engine.start();
+        assertTrue(awaitStopped(engine, 10_000), "auto-stop once the good channel drains");
+        assertFalse(engine.isRunning());
+        assertTrue(engine.framesWritten() > 0, "frames keep counting through the failure");
+        assertEquals(sink.blocks.size(), engine.framesWritten() / BS);
+        for (float[][] block : sink.blocks) {
+            for (float[] ch : block) {
+                for (float s : ch) assertTrue(Float.isFinite(s), "block contains only finite samples");
+            }
         }
     }
 
-    // ── helpers ──────────────────────────────────────────────────────
-
-    private static void awaitStopped(EngineThread e, long ms) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + ms;
-        while (e.isRunning() && System.currentTimeMillis() < deadline) {
-            TimeUnit.MILLISECONDS.sleep(5);
-        }
-    }
-
-    private static SineSource sine(int freq, double level, long frames) {
-        return new SineSource(SR, freq, level, 1, frames);
-    }
-
-    // ── tests ────────────────────────────────────────────────────────
+    // ── containment: failing sink ────────────────────────────────────
 
     @Test
-    @Timeout(15)
-    void fileMixAutoStop() throws Exception {
-        Mixer mixer = new Mixer(SR, BS);
-        mixer.addChannel("a").setSource(sine(440, 0.25, FINITE_FRAMES));
-        mixer.addChannel("b").setSource(sine(880, 0.25, FINITE_FRAMES));
-
-        TestSink sink = new TestSink();
-        EngineThread engine = new EngineThread(mixer, mixer.getMaster(), sink);
-
+    void failingSinkCountsErrorsAndKeepsRunning() {
+        Mixer m = new Mixer(SR, BS);
+        m.addChannel("a").setSource(new SineSource(SR, 440, 0.25, 1, (long) (SR * 0.3)));
+        TestSink sink = new TestSink(0, false);
+        sink.failAfterWrite = 2;
+        EngineThread engine = new EngineThread(m, m.getMaster(), sink);
         engine.start();
-        awaitStopped(engine, 10_000);
-        assertFalse(engine.isRunning(), "engine should auto-stop when allIdle");
-
-        assertEquals(SR, sink.openedSampleRate);
-        assertEquals(BS, sink.openedBlockSize);
-        assertEquals(2, sink.openedChannels);
-        assertTrue(sink.closed, "sink should be closed after engine stops");
-
-        long frames = engine.framesWritten();
-        assertTrue(frames >= FINITE_FRAMES && frames <= FINITE_FRAMES + 2 * BS,
-                "framesWritten=" + frames + " expected ~" + FINITE_FRAMES
-                        + " (engine writes full blocks + drain block, offline trims)");
+        assertTrue(awaitStopped(engine, 10_000), "auto-stop still works when the sink fails");
+        assertFalse(engine.isRunning());
+        assertTrue(engine.errorsLogged() > 0, "engine-boundary failures are counted");
+        assertTrue(engine.framesWritten() > 0, "frames keep counting through failures");
     }
 
+    // ── stop semantics ───────────────────────────────────────────────
+
     @Test
-    @Timeout(15)
-    void throwingSourceAndSink() throws Exception {
-        // throwing source: succeeds 3 blocks, throws 8 blocks, then exhausts
-        final int[] calls = {0};
-        final int throwStart = 4, throwEnd = 12;
-        Source throwingSource = new Source() {
-            @Override
-            public int read(AudioBuffer b) {
-                calls[0]++;
-                if (calls[0] >= throwStart && calls[0] <= throwEnd) {
-                    throw new RuntimeException("simulated source failure");
-                }
-                if (calls[0] > throwEnd) return 0;
-                // first 3 blocks: fill with sine data
-                return new SineSource(SR, 440, 0.25, 1, FINITE_FRAMES).read(b);
-            }
-            @Override public void close() {}
-        };
-
-        Mixer mixer = new Mixer(SR, BS);
-        mixer.addChannel("bad").setSource(throwingSource);
-        mixer.addChannel("good").setSource(sine(880, 0.25, FINITE_FRAMES));
-
-        TestSink sink = new TestSink();
-        sink.throwOnFirstN = 2; // sink also throws on first 2 writes
-
-        EngineThread engine = new EngineThread(mixer, mixer.getMaster(), sink);
+    void stopJoinsWithinSecondAndIsIdempotent() {
+        Mixer m = new Mixer(SR, BS);
+        m.addChannel("inf").setSource(new SineSource(SR, 440, 0.25, 1, -1));
+        TestSink sink = new TestSink(1, false);
+        EngineThread engine = new EngineThread(m, m.getMaster(), sink);
         engine.start();
-        awaitStopped(engine, 10_000);
+        assertTrue(awaitRunning(engine, 2000));
 
-        assertTrue(engine.errorsLogged() > 0, "errorsLogged=" + engine.errorsLogged());
-        assertTrue(engine.framesWritten() > 0, "should keep counting frames");
+        long t0 = System.nanoTime();
+        engine.stop();
+        long joinMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+        assertTrue(joinMs < 1000, "stop joins within 1 s, took " + joinMs + " ms");
         assertFalse(engine.isRunning());
         assertTrue(sink.closed);
-    }
 
-    @Test
-    @Timeout(15)
-    void stopWhileRunning() throws Exception {
-        Mixer mixer = new Mixer(SR, BS);
-        mixer.addChannel("inf").setSource(sine(440, 0.25, -1)); // infinite
-
-        TestSink sink = new TestSink();
-        sink.sleepMsPerWrite = 10; // ensure thread is blocked in sink.write
-
-        EngineThread engine = new EngineThread(mixer, mixer.getMaster(), sink);
-        engine.start();
-        TimeUnit.MILLISECONDS.sleep(100);
-
-        long t0 = System.currentTimeMillis();
-        engine.stop();
-        long elapsed = System.currentTimeMillis() - t0;
-
-        assertFalse(engine.isRunning());
-        assertTrue(elapsed <= 1000, "stop() took " + elapsed + " ms, must join within 1 s");
-
-        // idempotent double-stop
         engine.stop();
         assertFalse(engine.isRunning());
+        assertThrows(IllegalStateException.class, engine::start);
     }
 
+    // ── tail extends playback ────────────────────────────────────────
+
     @Test
-    @Timeout(30)
-    void delayTail() throws Exception {
-        int sourceFrames = 2048;
-        int tailMs = 200;
-        int tailFrames = (int) ((long) tailMs * SR / 1000); // 9600
-
-        Mixer mixer = new Mixer(SR, BS);
-        Channel ch = mixer.addChannel("src");
-        ch.setSource(sine(440, 0.25, sourceFrames));
-        ch.addEffect(new Delay(SR, 1000).delayMs(tailMs).feedback(0).wet(1.0).dry(0.0));
-
-        TestSink sink = new TestSink();
-        EngineThread engine = new EngineThread(mixer, mixer.getMaster(), sink);
+    void delayTailPlaysBeyondSourceLength() {
+        long srcFrames = (long) (SR * 0.3);
+        Mixer m = new Mixer(SR, BS);
+        Channel ch = m.addChannel("d");
+        ch.setSource(new SineSource(SR, 440, 0.25, 1, srcFrames));
+        ch.addEffect(new Delay(SR, 1000).delayMs(250).feedback(0.4).wet(1).dry(0));
+        TestSink sink = new TestSink(0, false);
+        EngineThread engine = new EngineThread(m, m.getMaster(), sink);
         engine.start();
-        awaitStopped(engine, 15_000);
-
-        long frames = engine.framesWritten();
-        assertTrue(frames > sourceFrames,
-                "engine must play tail: framesWritten=" + frames + " > " + sourceFrames);
+        assertTrue(awaitStopped(engine, 30_000), "engine stops once the tail decays");
+        assertFalse(engine.isRunning());
+        assertTrue(engine.framesWritten() > srcFrames, "engine plays the delay tail");
     }
 
+    // ── parameter hammering while running ────────────────────────────
+
     @Test
-    @Timeout(10)
-    void concurrentGainHammer() throws Exception {
-        Mixer mixer = new Mixer(SR, BS);
-        Channel ch1 = mixer.addChannel("a");
-        Channel ch2 = mixer.addChannel("b");
-        ch1.setSource(sine(440, 0.25, -1));
-        ch2.setSource(sine(880, 0.25, -1));
-
-        TestSink sink = new TestSink();
-        EngineThread engine = new EngineThread(mixer, mixer.getMaster(), sink);
+    void concurrentGainHammerRunsClean() throws Exception {
+        Mixer m = new Mixer(SR, BS);
+        Channel ch = m.addChannel("g");
+        ch.setSource(new SineSource(SR, 330, 0.25, 1, -1));
+        TestSink sink = new TestSink(1, false);
+        EngineThread engine = new EngineThread(m, m.getMaster(), sink);
         engine.start();
+        assertTrue(awaitRunning(engine, 2000));
 
-        AtomicBoolean hammerDone = new AtomicBoolean(false);
-        CopyOnWriteArrayList<Throwable> errors = new CopyOnWriteArrayList<>();
-
+        AtomicReference<Throwable> hammerError = new AtomicReference<>();
         Thread hammer = new Thread(() -> {
             try {
-                long deadline = System.currentTimeMillis() + 200;
-                int i = 0;
-                while (!hammerDone.get() && System.currentTimeMillis() < deadline) {
-                    ch1.setGainDb(-24.0 + (i % 48));
-                    ch2.setGainDb(-24.0 + ((i + 12) % 48));
-                    i++;
-                    TimeUnit.MILLISECONDS.sleep(1);
+                long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200);
+                while (System.nanoTime() < end && engine.isRunning()) {
+                    ch.setGainDb(-24 * Math.random());
                 }
-            } catch (Throwable t) { errors.add(t); }
+            } catch (Throwable t) { hammerError.set(t); }
         }, "gain-hammer");
         hammer.start();
-        hammer.join(500);
-        hammerDone.set(true);
+        hammer.join(10_000);
+        assertFalse(hammer.isAlive(), "hammer thread joined");
+        assertNull(hammerError.get(), "no exception in hammer thread");
 
         engine.stop();
-        assertTrue(errors.isEmpty(), "hammer exceptions: " + errors);
+        assertFalse(engine.isRunning());
+        assertEquals(0, engine.errorsLogged());
+        assertTrue(engine.framesWritten() > 0);
+    }
+
+    // ── interrupt unblocks a stuck sink ─────────────────────────────
+
+    /** Blocks until interrupted — simulates a real sink stuck on I/O. */
+    static final class BlockingSink implements AudioSink {
+        volatile boolean writeEntered;
+        volatile boolean closed;
+
+        @Override
+        public void open(int channels, int sampleRate, int blockSize) { }
+
+        @Override
+        public void write(float[][] data, int frames) {
+            writeEntered = true;
+            try { Thread.sleep(Long.MAX_VALUE); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
+
+        @Override
+        public void close() { closed = true; }
+    }
+
+    @Test
+    void interruptUnblocksStop() throws Exception {
+        Mixer m = new Mixer(SR, BS);
+        m.addChannel("x").setSource(new SineSource(SR, 440, 0.25, 1, -1));
+        BlockingSink sink = new BlockingSink();
+        EngineThread engine = new EngineThread(m, m.getMaster(), sink);
+        engine.start();
+        // spin until the engine thread enters sink.write
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (!sink.writeEntered && System.nanoTime() < deadline) Thread.sleep(1);
+        assertTrue(sink.writeEntered, "engine reached sink.write");
+
+        long t0 = System.nanoTime();
+        engine.stop();
+        long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+
+        assertTrue(ms < 2000, "stop returned in " + ms + " ms");
+        assertFalse(engine.isRunning());
+        assertTrue(sink.closed, "sink closed after interrupt");
     }
 }

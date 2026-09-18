@@ -1,33 +1,33 @@
 package audiomix.io;
 
 /**
- * Blocking audio output sink — the engine's clock.
- * {@link #write} blocks for the duration of the hardware buffer cycle;
- * a real implementation must honour {@link Thread#interrupt()} so that
- * {@link audiomix.core.EngineThread#stop()} can unblock it promptly.
+ * Blocking audio output destination for the real-time engine. This is the
+ * engine's clock: {@link #write} blocks until the device accepts a block,
+ * pacing the render loop. All methods are called from the engine thread.
  */
 public interface AudioSink {
 
     /**
-     * Open the sink for playback.
+     * Prepares the output for a stream.
      *
-     * @param channels   number of channels (2 for stereo)
-     * @param sampleRate sample rate in Hz (&gt; 0)
-     * @param blockSize  frames per block (&gt; 0)
-     * @throws IllegalStateException if already open
+     * @param channels   channel count (2 for the built-in engine)
+     * @param sampleRate frames per second (&gt; 0)
+     * @param blockSize  frames per write call (&gt; 0)
+     * @throws IllegalArgumentException if any argument is out of range
      */
     void open(int channels, int sampleRate, int blockSize);
 
     /**
-     * Write one block of interleaved data. Blocks until the hardware
-     * buffer cycle completes.
+     * Blocks until {@code frames} frames are accepted. Called once per block;
+     * the blocking time is the real-time clock. Must return promptly when the
+     * calling thread is interrupted: restore the interrupt flag and return, or
+     * throw.
      *
-     * @param data   non-interleaved sample data ({@code data.length == channels})
-     * @param frames number of valid frames ({@code &le; blockSize})
-     * @throws InterruptedException if the thread is interrupted while blocking
+     * @param data   non-interleaved samples, nominal range ±1.0
+     * @param frames frames to write (≤ {@code data[0].length})
      */
-    void write(float[][] data, int frames) throws InterruptedException;
+    void write(float[][] data, int frames);
 
-    /** Close the sink and release any underlying resources. */
+    /** Releases the output device; called once, after the last write. */
     void close();
 }
