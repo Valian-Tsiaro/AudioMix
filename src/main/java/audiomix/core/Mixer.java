@@ -1,12 +1,16 @@
 package audiomix.core;
 
+import audiomix.io.DeviceInfo;
 import audiomix.io.AudioIOException;
 import audiomix.io.WavFormat;
 import audiomix.io.WavWriter;
 
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.logging.Logger;
 
@@ -23,6 +27,8 @@ public final class Mixer {
     private final int blockSize;
     private final CopyOnWriteArrayList<Channel> channels = new CopyOnWriteArrayList<>();
     private final CopyOnWriteArrayList<AuxBus> auxBuses = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<Bus> busOrder = new CopyOnWriteArrayList<>();
+    private final ConcurrentHashMap<Bus, CopyOnWriteArrayList<DeviceInfo>> bindings = new ConcurrentHashMap<>();
     private final MasterBus master;
 
     /**
@@ -48,6 +54,8 @@ public final class Mixer {
         this.sampleRate = sampleRate;
         this.blockSize = blockSize;
         this.master = new MasterBus(sampleRate, blockSize);
+        master.owner = this;
+        busOrder.add(master);
     }
 
     /**
@@ -103,7 +111,9 @@ public final class Mixer {
     public AuxBus addAuxBus(String name) {
         if (name == null || name.isBlank()) throw new IllegalArgumentException("name=" + name);
         AuxBus aux = new AuxBus(name, sampleRate, blockSize);
+        aux.owner = this;
         auxBuses.add(aux);
+        busOrder.add(aux);
         return aux;
     }
 
@@ -126,6 +136,34 @@ public final class Mixer {
      * @return current aux buses
      */
     public List<AuxBus> getAuxBuses() { return Collections.unmodifiableList(auxBuses); }
+
+    /**
+     * Appends a bus → device binding to this mixer's registry. Inert
+     * data until the engine consults it (Step 26). Callable from any
+     * thread.
+     *
+     * @param bus    bus doing the binding
+     * @param device output device
+     */
+    void registerBinding(Bus bus, DeviceInfo device) {
+        bindings.computeIfAbsent(bus, b -> new CopyOnWriteArrayList<>()).add(device);
+    }
+
+    /**
+     * Snapshot of device bindings: buses in creation order, devices in
+     * bind order. The lists and map returned are unmodifiable (the
+     * registry itself keeps updating as bindings are added).
+     *
+     * @return unmodifiable bus → devices map
+     */
+    public Map<Bus, List<DeviceInfo>> getBindings() {
+        Map<Bus, List<DeviceInfo>> view = new LinkedHashMap<>();
+        for (Bus b : busOrder) {
+            List<DeviceInfo> list = bindings.get(b);
+            view.put(b, list == null ? List.of() : Collections.unmodifiableList(list));
+        }
+        return Collections.unmodifiableMap(view);
+    }
 
     public MasterBus getMaster() { return master; }
 

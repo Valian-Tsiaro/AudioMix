@@ -1,5 +1,7 @@
 package audiomix.core;
 
+import audiomix.io.DeviceInfo;
+
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -19,6 +21,8 @@ public class Bus {
     protected final int blockSize;
     private final ParamSmoother gainSmoother;
     private final CopyOnWriteArrayList<Effect> effects = new CopyOnWriteArrayList<>();
+    Mixer owner; // ponytail: set by Mixer; inert until Step 26
+    private static final audiomix.io.DeviceManager DEVICES = new audiomix.io.DeviceManager();
 
     /**
      * @param sampleRate project sample rate in Hz (&gt; 0)
@@ -112,5 +116,36 @@ public class Bus {
      */
     public boolean isChainIdle() {
         return effects.isEmpty() || effects.stream().allMatch(Effect::isIdle);
+    }
+
+    /**
+     * Binds this bus to an output device, appending to the owning
+     * {@link Mixer}'s binding registry. Registered with volatile
+     * semantics; taking effect at a block boundary. Callable from
+     * any thread.
+     *
+     * @param device output device (non-null)
+     * @throws IllegalArgumentException if device is null
+     * @throws IllegalStateException    if not owned by a mixer
+     */
+    public void bindToDevice(DeviceInfo device) {
+        if (device == null) throw new IllegalArgumentException("device is null");
+        if (owner == null) throw new IllegalStateException("bus has no mixer");
+        owner.registerBinding(this, device);
+    }
+
+    /**
+     * Binds this bus to the system default speakers. Callable from any
+     * thread.
+     *
+     * @throws IllegalStateException    if not owned by a mixer
+     * @throws audiomix.io.AudioIOException if there is no default output device
+     */
+    public void bindToDefaultSpeakers() {
+        DeviceInfo d = DEVICES.defaultOutput();
+        if (d == null) {
+            throw new audiomix.io.AudioIOException("no default output device available");
+        }
+        bindToDevice(d);
     }
 }
