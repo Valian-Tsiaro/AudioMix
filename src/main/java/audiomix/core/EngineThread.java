@@ -78,6 +78,7 @@ public final class EngineThread {
      * can unblock promptly.
      */
     public void stop() {
+        if (!started.get()) return;
         running.set(false);
         if (Thread.currentThread() == thread) return;
         thread.interrupt();
@@ -94,7 +95,7 @@ public final class EngineThread {
     /** Total frames pushed to the sink (full blocks). Monotonic. Counts silence blocks written during error containment even if the sink also rejects the retry. Also counts blocks whose write was skipped by an interrupt. */
     public long framesWritten() { return framesWritten.get(); }
 
-    /** Number of per-block failures contained by the engine. Monotonic. Counts each failed render or primary write; retry-failure is not double-counted. */
+    /** Number of per-block failures contained by the engine. Monotonic. Counts each failed render or primary write; retry-failure is not double-counted. Also counts open-failure and any other Throwable that escapes the render loop. */
     public long errorsLogged() { return errorsLogged.get(); }
 
     private void run() {
@@ -125,7 +126,7 @@ public final class EngineThread {
             }
         } catch (Throwable t) {
             errorsLogged.incrementAndGet();
-            LOG.warning("engine sink open failed: " + t.getMessage());
+            LOG.warning("engine failed: " + t.getMessage());
         } finally {
             running.set(false);
             try { sink.close(); } catch (Throwable t) {

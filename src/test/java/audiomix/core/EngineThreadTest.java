@@ -208,6 +208,22 @@ class EngineThreadTest {
         assertThrows(IllegalStateException.class, engine::start);
     }
 
+    // ── stop-before-start does not poison the thread ───────────────
+
+    @Test
+    void stopBeforeStartDoesNotPoisonThread() {
+        Mixer m = new Mixer(SR, BS);
+        m.addChannel("x").setSource(new SineSource(SR, 440, 0.25, 1, (long) (SR * 0.3)));
+        TestSink sink = new TestSink(1, false);
+        EngineThread engine = new EngineThread(m, m.getMaster(), sink);
+        engine.stop();        // before start — must not poison
+        engine.start();
+        assertTrue(awaitStopped(engine, 10_000), "engine stops after stop-before-start");
+        assertFalse(engine.isRunning());
+        assertEquals(0, engine.errorsLogged());
+        assertTrue(engine.framesWritten() > 0);
+    }
+
     // ── tail extends playback ────────────────────────────────────────
 
     @Test
